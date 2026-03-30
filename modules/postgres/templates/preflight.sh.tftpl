@@ -1,0 +1,129 @@
+#!/bin/sh
+# Preflight validation for modules/postgres.
+# Rendered and executed by the pg_preflight null_resource provisioner.
+set -eu
+
+PG_VERSION="${pg_version}"
+CONF_D_DIR_OVERRIDE="${conf_d_dir}"
+PG_USER="${pg_user}"
+PG_GROUP="${pg_group}"
+
+# ---------------------------------------------------------------------------
+# 1. Required binaries
+# ---------------------------------------------------------------------------
+for cmd in pg_ctl psql; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "ERROR: $cmd not found in PATH" >&2
+    exit 1
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 2. PostgreSQL is running — verify via data_directory query
+# ---------------------------------------------------------------------------
+DATA_DIR=$(sudo -u "$PG_USER" psql -tAc "SHOW data_directory;" 2>/dev/null) || {
+  echo "ERROR: PostgreSQL is not running or not accepting local connections" >&2
+  exit 1
+}
+DATA_DIR=$(echo "$DATA_DIR" | tr -d '[:space:]')
+if [ -z "$DATA_DIR" ]; then
+  echo "ERROR: SHOW data_directory returned empty — cannot proceed" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 3. include_dir in postgresql.conf
+# ---------------------------------------------------------------------------
+PG_CONF="$DATA_DIR/postgresql.conf"
+
+# Extract the first active (non-commented) include_dir directive.
+INCLUDE_DIR=$(sudo -u "$PG_USER" grep -E "^[[:space:]]*include_dir[[:space:]]*=" "$PG_CONF" 2>/dev/null \
+  | tail -1 \
+  | sed "s/[^=]*=[[:space:]]*//" \
+  | tr -d "'\"\n\r" \
+  | xargs) || true
+
+if [ -z "$INCLUDE_DIR" ]; then
+  echo "ERROR: postgresql.conf has no active include_dir directive." \
+       "Without it the module's conf.d files are silently ignored by PostgreSQL." >&2
+  exit 1
+fi
+
+# Resolve relative include_dir against data_directory.
+case "$INCLUDE_DIR" in
+  /*) ;;
+  *)  INCLUDE_DIR="$DATA_DIR/$INCLUDE_DIR" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# 4. Resolve and validate conf.d path
+# ---------------------------------------------------------------------------
+if [ -n "$CONF_D_DIR_OVERRIDE" ]; then
+  # Explicit conf_d_dir: must match include_dir.
+  if [ "$CONF_D_DIR_OVERRIDE" != "$INCLUDE_DIR" ]; then
+    echo "ERROR: conf_d_dir '$CONF_D_DIR_OVERRIDE' does not match" \
+         "include_dir '$INCLUDE_DIR' in postgresql.conf" >&2
+    exit 1
+  fi
+  CONF_D_DIR="$CONF_D_DIR_OVERRIDE"
+else
+  CONF_D_DIR="$INCLUDE_DIR"
+fi
+
+if [ ! -d "$CONF_D_DIR" ]; then
+  echo "ERROR: conf.d directory '$CONF_D_DIR' does not exist" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Write permissions — SSH user must be able to sudo-write conf.d
+# ---------------------------------------------------------------------------
+if ! sudo test -w "$CONF_D_DIR" 2>/dev/null; then
+  echo "ERROR: conf.d directory '$CONF_D_DIR' is not writable via sudo." \
+       "Ensure the SSH user has passwordless sudo." >&2
+  exit 1
+fi
+
+# Verify chown is available under sudo.
+if ! sudo chown --version >/dev/null 2>&1; then
+  echo "ERROR: sudo chown is not available — cannot set file ownership" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Informational notices (non-blocking)
+# ---------------------------------------------------------------------------
+MANAGED_PARAMS="${join(" ", managed_params)}"
+
+# Active managed params in postgresql.conf (overridden by include_dir — informational only).
+FOUND_IN_CONF=""
+for param in $MANAGED_PARAMS; do
+  if sudo -u "$PG_USER" grep -qE "^[[:space:]]*$param[[:space:]]*=" "$PG_CONF" 2>/dev/null; then
+    FOUND_IN_CONF="$FOUND_IN_CONF $param"
+  fi
+done
+if [ -n "$FOUND_IN_CONF" ]; then
+  echo "NOTICE: The following managed parameters are set directly in postgresql.conf." \
+       "They will be overridden by include_dir (conf.d takes precedence in standard Debian/Ubuntu installs):$FOUND_IN_CONF"
+fi
+
+# Managed params in postgresql.auto.conf (ALTER SYSTEM — takes precedence over conf.d).
+AUTO_CONF="$DATA_DIR/postgresql.auto.conf"
+FOUND_IN_AUTO=""
+for param in $MANAGED_PARAMS; do
+  if [ -f "$AUTO_CONF" ] && sudo -u "$PG_USER" grep -qE "^[[:space:]]*$param[[:space:]]*=" "$AUTO_CONF" 2>/dev/null; then
+    FOUND_IN_AUTO="$FOUND_IN_AUTO $param"
+  fi
+done
+if [ -n "$FOUND_IN_AUTO" ]; then
+  echo "NOTICE: The following managed parameters appear in postgresql.auto.conf" \
+       "(set via ALTER SYSTEM). ALTER SYSTEM takes precedence over conf.d:$FOUND_IN_AUTO"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Write discovered values for scp retrieval by the Terraform runner
+# ---------------------------------------------------------------------------
+printf '{"data_dir":"%s","conf_d_dir":"%s"}\n' "$DATA_DIR" "$CONF_D_DIR" \
+  > /tmp/pg_discovered.json
+
+echo "Preflight passed. conf_d=$CONF_D_DIR data_dir=$DATA_DIR"

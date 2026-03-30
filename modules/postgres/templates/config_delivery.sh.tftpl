@@ -1,0 +1,88 @@
+#!/bin/sh
+# Config delivery for modules/postgres.
+# Rendered and executed by the pg_config null_resource provisioner.
+# DATA_DIR and CONF_D_DIR are baked in at render time from pg_discovered.json.
+set -eu
+
+PG_USER="${pg_user}"
+PG_GROUP="${pg_group}"
+DATA_DIR="${data_dir}"
+CONF_D_DIR="${conf_d_dir}"
+
+TUNE_CONF_B64="${tune_conf_b64}"
+OVERRIDES_CONF_B64="${overrides_conf_b64}"
+
+# ---------------------------------------------------------------------------
+# 1. Backup existing conf files (best-effort — may not exist on first apply)
+# ---------------------------------------------------------------------------
+if sudo test -f "$CONF_D_DIR/01-pgtune.conf"; then
+  sudo cp -p "$CONF_D_DIR/01-pgtune.conf" /tmp/01-pgtune.conf.bak
+fi
+if sudo test -f "$CONF_D_DIR/02-overrides.conf"; then
+  sudo cp -p "$CONF_D_DIR/02-overrides.conf" /tmp/02-overrides.conf.bak
+fi
+
+# ---------------------------------------------------------------------------
+# Rollback handler — restores last known-good config and reloads
+# ---------------------------------------------------------------------------
+_rollback() {
+  echo "ERROR: Config delivery failed — restoring backup." >&2
+  if [ -f /tmp/01-pgtune.conf.bak ]; then
+    sudo cp /tmp/01-pgtune.conf.bak "$CONF_D_DIR/01-pgtune.conf" || true
+  fi
+  if [ -f /tmp/02-overrides.conf.bak ]; then
+    sudo cp /tmp/02-overrides.conf.bak "$CONF_D_DIR/02-overrides.conf" || true
+  fi
+  sudo -u "$PG_USER" pg_ctl reload -D "$DATA_DIR" || true
+  exit 1
+}
+trap _rollback EXIT
+
+# ---------------------------------------------------------------------------
+# 2. Write new conf files via temp files (avoids pipefail dependency)
+# ---------------------------------------------------------------------------
+printf '%s' "$TUNE_CONF_B64"      | base64 -d > /tmp/pg_tune.tmp
+printf '%s' "$OVERRIDES_CONF_B64" | base64 -d > /tmp/pg_overrides.tmp
+sudo cp /tmp/pg_tune.tmp      "$CONF_D_DIR/01-pgtune.conf"
+sudo cp /tmp/pg_overrides.tmp "$CONF_D_DIR/02-overrides.conf"
+rm -f /tmp/pg_tune.tmp /tmp/pg_overrides.tmp
+
+# ---------------------------------------------------------------------------
+# 3. Set ownership and permissions
+# ---------------------------------------------------------------------------
+sudo chown "$PG_USER:$PG_GROUP" "$CONF_D_DIR/01-pgtune.conf" "$CONF_D_DIR/02-overrides.conf"
+sudo chmod 640 "$CONF_D_DIR/01-pgtune.conf" "$CONF_D_DIR/02-overrides.conf"
+
+# ---------------------------------------------------------------------------
+# 4. Reload — validates config syntax before any restart
+# ---------------------------------------------------------------------------
+sudo -u "$PG_USER" pg_ctl reload -D "$DATA_DIR"
+
+# ---------------------------------------------------------------------------
+# 5. Query pending_restart params (PostgreSQL's authoritative list)
+# ---------------------------------------------------------------------------
+PENDING=$(sudo -u "$PG_USER" psql -tAc \
+  "SELECT name FROM pg_settings WHERE pending_restart = true;" 2>/dev/null \
+  | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+
+# ---------------------------------------------------------------------------
+# 6. Restart decision
+# ---------------------------------------------------------------------------
+%{ if pg_force_restart ~}
+echo "Restarting PostgreSQL (pg_force_restart = true)..."
+sudo -u "$PG_USER" pg_ctl restart -D "$DATA_DIR"
+%{ else ~}
+%{ if pg_skip_restart ~}
+if [ -n "$PENDING" ]; then
+  echo "NOTICE: pg_skip_restart = true — skipping restart despite pending params: $PENDING"
+fi
+%{ else ~}
+if [ -n "$PENDING" ]; then
+  echo "Restarting PostgreSQL (pending params require restart: $PENDING)..."
+  sudo -u "$PG_USER" pg_ctl restart -D "$DATA_DIR"
+fi
+%{ endif ~}
+%{ endif ~}
+
+trap - EXIT
+echo "Config delivery complete. conf_d=$CONF_D_DIR"
