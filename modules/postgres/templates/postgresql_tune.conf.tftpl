@@ -1,0 +1,34 @@
+# postgresql.conf — performance tuning (PostgreSQL ${pg_version})
+# Managed by Terraform. Do not edit manually.
+# Overwritten on every terraform apply.
+# Algorithm: https://github.com/le0pard/pgtune
+# Inputs: ${pg_total_memory_gb}GB RAM, ${pg_cpu_num} CPUs, ${pg_hd_type}
+
+# Connections
+max_connections = ${params["max_connections"]}
+
+# Memory
+shared_buffers           = ${params["shared_buffers"]}
+effective_cache_size     = ${params["effective_cache_size"]}
+maintenance_work_mem     = ${params["maintenance_work_mem"]}
+work_mem                 = ${params["work_mem"]}
+huge_pages               = ${params["huge_pages"]}
+
+# WAL
+wal_buffers                  = ${params["wal_buffers"]}
+min_wal_size                 = ${params["min_wal_size"]}
+max_wal_size                 = ${params["max_wal_size"]}
+checkpoint_completion_target = ${params["checkpoint_completion_target"]}
+
+# Planner
+default_statistics_target = ${params["default_statistics_target"]}
+random_page_cost          = ${params["random_page_cost"]}
+effective_io_concurrency  = ${params["effective_io_concurrency"]}
+%{ if parallel_enabled ~}
+
+# Parallelism
+max_worker_processes             = ${params["max_worker_processes"]}
+max_parallel_workers_per_gather  = ${params["max_parallel_workers_per_gather"]}
+max_parallel_workers             = ${params["max_parallel_workers"]}
+max_parallel_maintenance_workers = ${params["max_parallel_maintenance_workers"]}
+%{ endif ~}

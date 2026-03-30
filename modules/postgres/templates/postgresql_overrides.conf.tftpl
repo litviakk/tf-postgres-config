@@ -1,0 +1,7 @@
+# postgresql.conf — manual overrides
+# Managed by Terraform via pg_overrides variable.
+# Loaded after 01-pgtune.conf — values here take precedence.
+# Do not edit manually — overwritten on every terraform apply.
+%{ for key, value in overrides ~}
+${key} = ${value}
+%{ endfor ~}
